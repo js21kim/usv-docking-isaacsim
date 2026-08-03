@@ -1,0 +1,29 @@
+# usvdock — isaac-lab-base-fixed 위에 바로 얹는다.
+#
+# ★ 초기에는 marinelab:latest 를 베이스로 썼으나 끊었다.
+#   usvdock 의 파이썬 코드는 marinelab 을 **import 하지 않는다** — 자체 3자유도
+#   Fossen 모델을 쓴다. marinelab 은 그저 isaaclab+rsl-rl 이 들어 있는 이미지라서
+#   베이스로 삼았을 뿐이다.
+#   의존을 끊으면 협업자가 marinelab / constrained-albc(동료의 비공개 연구 코드)를
+#   받을 필요가 없어져 설치가 크게 단순해진다.
+#
+# 베이스 isaac-lab-base-fixed 를 만드는 법은 docker/Dockerfile.isaaclab-fix 참조.
+# (isaac-lab-base 는 flatdict 빌드 실패로 핵심 isaaclab 패키지가 누락된 채
+#  exit 0 으로 끝난다. 그 복구 레이어가 -fixed 다)
+ARG BASE_IMAGE=isaac-lab-base-fixed:latest
+FROM ${BASE_IMAGE}
+
+SHELL ["/bin/bash", "-c"]
+
+# 06_ALBC_IsaacSim 에서 확인한 것: 핀 없이 설치하면 cmeel-boost 서브트리를
+# 무한 백트래킹한다. 검증된 조합을 고정한다.
+COPY --from=docker isaaclab-core.constraints.txt /tmp/isaaclab-core.constraints.txt
+
+COPY . /workspace/usvdock
+
+RUN cd /workspace/isaaclab \
+    && PIP_CONSTRAINT=/tmp/isaaclab-core.constraints.txt \
+       /isaac-sim/python.sh -m pip install -e /workspace/usvdock \
+    && /isaac-sim/python.sh -m pip show usvdock | grep -E "^Name|^Version"
+
+WORKDIR /workspace/usvdock

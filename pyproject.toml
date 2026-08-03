@@ -1,0 +1,14 @@
+[build-system]
+requires = ["setuptools>=64"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "usvdock"
+version = "0.1.0"
+description = "BlueBoat autonomous docking with LiDAR/FLS fusion on Isaac Lab (KRISO A1 presentation study)."
+requires-python = ">=3.10"
+# isaaclab / isaaclab_tasks / isaaclab_rl 은 pip 의존성이 아니다 — 이미지가 제공한다.
+dependencies = ["gymnasium", "torch", "numpy"]
+
+[tool.setuptools.packages.find]
+include = ["usvdock*"]

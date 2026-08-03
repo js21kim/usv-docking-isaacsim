@@ -1,0 +1,73 @@
+# isaac-lab-base 위에 얹는 수정 레이어 — 핵심 isaaclab 패키지 설치 복구
+#
+# ---------------------------------------------------------------------------
+# 무엇이 깨졌나
+#
+#   isaaclab/docker/Dockerfile.base 가 `isaaclab.sh --install` 을 돌리는데,
+#   source/isaaclab (핵심 패키지) 만 설치에 실패하고 나머지 5개
+#   (isaaclab_assets / _contrib / _mimic / _rl / _tasks) 는 성공한다.
+#   isaaclab.sh 는 실패한 모듈을 건너뛰고 다음으로 넘어가므로
+#   **docker build 는 exit 0 으로 끝난다.** 조용히 반쪽짜리 이미지가 나온다.
+#
+#   증상: /isaac-sim/python.sh -c "import isaaclab"
+#         -> ModuleNotFoundError: No module named 'isaaclab'
+#         site-packages 에 __editable__.isaaclab-*.pth 만 없다.
+#
+# ---------------------------------------------------------------------------
+# 왜 깨졌나
+#
+#   isaaclab==0.54.0 의 의존성에 flatdict==4.0.1 이 있다. flatdict 은 sdist(tar.gz)로만
+#   배포되고 pyproject.toml 없이 구식 setup.py 를 쓴다.
+#
+#   pip 은 기본적으로 **격리된 빌드 환경**을 만들고 거기에 최신 setuptools 를 새로 받는다.
+#   그 최신 setuptools 에는 pkg_resources 가 없어서(81 에서 제거됨) flatdict 의 setup.py 가
+#   임포트 단계에서 죽는다:
+#
+#     Getting requirements to build wheel: finished with status 'error'
+#       ModuleNotFoundError: No module named 'pkg_resources'
+#
+#   그런데 컨테이너 안 Isaac Sim python 에 설치된 setuptools 는 78.1.1 이고
+#   pkg_resources 가 **있다**. 즉 격리를 끄면 그대로 빌드된다.
+#   빌드 격리가 문제의 원인이고, 로컬 환경은 멀쩡하다.
+#
+#   시한폭탄 성격이다 — 저장소를 만들 당시에는 PyPI 최신 setuptools 에 아직
+#   pkg_resources 가 있었을 것이다. 코드가 아니라 바깥이 바뀌어서 깨진 경우다.
+#
+# ---------------------------------------------------------------------------
+# 빌드
+#   docker build -f /home/jason/06_ALBC_IsaacSim/docker/Dockerfile.isaaclab-fix \
+#                -t isaac-lab-base-fixed:latest \
+#                /home/jason/06_ALBC_IsaacSim/docker
+#
+# 이 레이어를 isaaclab 포크 안이 아니라 우리 쪽에 두는 이유:
+#   포크를 pristine 하게 유지하는 것이 3층 저장소 설계의 전제다.
+#   후배가 근본 수정을 해주면 이 파일을 통째로 지우고
+#   ISAACLAB_IMAGE 를 isaac-lab-base:latest 로 되돌리면 끝난다.
+
+ARG BASE_IMAGE=isaac-lab-base:latest
+FROM ${BASE_IMAGE}
+
+SHELL ["/bin/bash", "-c"]
+
+# 1) flatdict 을 빌드 격리 없이 먼저 설치한다.
+#    --no-build-isolation 이면 컨테이너의 setuptools 78.1.1(pkg_resources 포함)을 쓴다.
+# 2) 그 다음 핵심 isaaclab 을 editable 로 설치한다. 이제 flatdict 이 이미 있으므로
+#    의존성 해결 단계에서 sdist 빌드를 시도하지 않는다.
+# 3) 마지막으로 임포트가 실제로 되는지 확인한다 — 실패하면 build 를 여기서 멈춘다.
+#    (원본 빌드가 조용히 성공해버린 것이 이번 문제의 핵심이므로 반드시 검증한다)
+#    constraints 가 필요한 두 번째 이유:
+#      핀 없이 돌리면 리졸버가 cmeel-boost 를 시작으로 pinocchio(pin)/dex-retargeting/
+#      pytransform3d 서브트리를 끝없이 백트래킹한다. 8.3MB sdist 를 버전마다 받으며
+#      되짚어서 수십 분이 지나도 끝나지 않는다.
+#        INFO: pip is still looking at multiple versions of cmeel-boost ...
+#      isaaclab-core.constraints.txt 는 실행 중인 컨테이너가 **실제로 성공시킨** 조합을
+#      pip freeze 로 뽑은 것이다. 검증된 값이므로 탐색 공간만 없애고 결과는 바꾸지 않는다.
+COPY isaaclab-core.constraints.txt /tmp/isaaclab-core.constraints.txt
+
+RUN /isaac-sim/python.sh -m pip install --no-build-isolation --no-cache-dir "flatdict==4.0.1" \
+    && cd /workspace/isaaclab \
+    && PIP_CONSTRAINT=/tmp/isaaclab-core.constraints.txt \
+       /isaac-sim/python.sh -m pip install -e source/isaaclab \
+    && /isaac-sim/python.sh -c "import isaaclab; print('isaaclab', isaaclab.__version__)"
+
+WORKDIR /workspace/isaaclab
