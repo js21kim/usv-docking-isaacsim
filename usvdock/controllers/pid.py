@@ -39,18 +39,49 @@ def _wrap_pi(a: torch.Tensor) -> torch.Tensor:
 
 
 class DockingPID:
-    """시선각 유도 + 2-루프 PID (전진 / 회두) + FLS 기반 반응형 회피.
+    """제대로 된 도킹 파이프라인 — 경유점 2단계 진입 + 제동 프로파일 + 횡편차 루프 + 회피 이력.
 
     출력은 정규화 추력 [-1,1]² (좌현, 우현) — RL 정책과 동일한 인터페이스라
     같은 환경에서 그대로 비교할 수 있다.
 
-    ★ 회피는 "최적 빔 선택(steer-to-best-beam)" 방식이다.
-      FLS 빔마다 (목표 방위와의 각도차) + (막힘 벌점) 으로 비용을 매기고
-      최소 비용 빔 방향으로 조타한다. VFH/갭 추종의 단순화된 형태이며,
-      전역 계획 없이 현재 스캔만으로 동작한다 — RL 정책과 정보 조건이 같다.
+    ★ 왜 다시 썼는가 — 이전 구현의 실측 결함 2건
 
-      전역 경로계획(A*, RRT)을 쓰지 않은 이유: 그러면 PID 쪽에만 지도와 계획이
-      생겨 비교가 교란된다. 양쪽 다 **현재 스캔에 즉시 반응**하는 조건으로 맞춘다.
+      결함 1. 회피가 **접안 구조물을 장애물로 취급**했다. FLS 는 폐어구뿐 아니라
+        핑거·벽도 돌려준다. 목표는 슬립 안쪽(y=8.9), 구조물은 y=7.5~10.0 이므로
+        부두 4 m 안에서 목표 방위가 항상 막힌 것으로 판정되어 반대편으로 조타했다.
+        폐어구가 **하나도 없는** 장면에서도 횡오차 0.02 m 로 정렬해 놓고
+        2.31 m 를 남긴 채 선수 180°, 속력 0.000 으로 교착했다.
+        → 검출된 선석 기하로 알려진 구조물 빔을 제외(_avoid 참조).
+
+      결함 2. **진입 회랑이 없었다.** 목표점 하나만 보고 시선각 유도로 들어가니
+        슬립에 대각선으로 파고들어 핑거 끝을 스쳤다. 실측 충돌 시점:
+        선수 124°(필요 90°), 속력 0.51 m/s 순항 중, 목표까지 2.46 m.
+        감속 구간(종방향 1 m 이내)에 **진입하기도 전에** 부딪힌 것이다.
+        → 아래 4개 규칙으로 재구성.
+
+    ★ 설계 (실제 도킹 제어기의 표준 구성)
+
+      ① 2단계 경유점 진입
+         슬립 중심선 위, 입구 바깥 `entry_standoff` 지점에 경유점 W 를 둔다.
+         W 에 도달하고 선수가 정렬되기 전에는 슬립에 들어가지 않는다.
+         부족구동선은 횡이동이 안 되므로 **정렬 후 직진**이 유일한 안전한 진입이다.
+
+      ② 제동거리 기반 감속
+         v_ref = min(v_max, sqrt(2·a_brake·along)).
+         이전 구현은 v_ref = along×0.6 (상한 0.6) 이라 종방향 1 m 안에 들어와야
+         감속이 시작됐다. 제동거리를 알고 미리 줄인다.
+
+      ③ 최종 구간 횡편차 루프
+         중심선 이탈을 선수각 오프셋(게걸음각)으로 잡는다. 횡추력이 없으므로
+         이것이 유일한 수단이다. 유속이 있으면 정상상태 게걸음각이 남는다.
+
+      ④ 회피 이력(hysteresis)
+         우회 방향을 한 번 정하면 `avoid_hold_s` 동안 그 쪽을 유지한다.
+         이전 구현은 매 스텝 최적 빔을 다시 골라, 틀면 목표가 다시 열리고
+         되돌아오는 극한 주기에 빠졌다(실측 왕복 28회).
+
+    ★ 전역 경로계획(A*, RRT)은 여전히 쓰지 않는다. 회피는 현재 스캔에 반응한다.
+      다만 **선석은 이미 검출된 목표**이므로 그 기하를 쓰는 것은 계획이 아니라 유도다.
     """
 
     def __init__(self, num_envs: int, device: str, dt: float):
@@ -63,16 +94,55 @@ class DockingPID:
         # 이득: 저속 정밀 접근용으로 보수적으로 잡았다.
         self.kp_d, self.ki_d, self.kd_d = 0.55, 0.02, 0.25
         self.kp_y, self.ki_y, self.kd_y = 1.30, 0.01, 0.35
-        self.approach_speed = 0.6  # 목표 접근 속력 [m/s]
+        self.approach_speed = 0.6  # 순항 접근 속력 [m/s]
 
-        # --- FLS 회피 파라미터 ---
+        # --- ① 경유점 진입 ---
+        # 대기선은 입구에서 이만큼 앞. 0.80 으로 뒀다가 핑거에 닿았다:
+        #   제동거리 v²/2a = 0.45²/0.24 = 0.84 m + 게걸음 자세에서 선수부가
+        #   y 로 0.5 m 더 뻗는다 → 최소 1.4 m 는 필요하다.
+        self.entry_standoff = 1.70  # [m]
+        self.los_lookahead = 1.8  # LOS 전방주시거리 Δ [m]. 작을수록 공격적으로 복귀
+        self.entry_x_tol = 0.35  # 중심선 정렬 허용 [m]
+        self.entry_yaw_tol = math.radians(20.0)  # 선수 정렬 허용
+        self.entry_abort_x = 0.90  # 이만큼 벗어나면 다시 경유점 단계로
+
+        # --- ② 제동 프로파일 ---
+        # 목표 허용오차(종방향 0.35 m, 속력 0.20 m/s)를 만족하려면
+        # along=0.2 m 에서 v≈0.2 여야 한다 → a = v²/(2·along) ≈ 0.10
+        self.brake_accel = 0.12  # [m/s²]
+
+        # --- ③ 횡편차 루프 ---
+        # ILOS(적분 시선각): 정상 유속을 적분항으로 상쇄한다.
+        #   비적분 LOS 는 유속을 **원리적으로** 못 이긴다. 게걸음각 δ 로 유속 V 를
+        #   상쇄하려면 u·sin(δ)=V 이어야 하는데, δ=atan2(x_err, Δ) 는 x_err 가
+        #   커져야만 커지므로 정상 편차가 남는다. 실측(유속 0.30): 횡편차가
+        #   +0.03 → +1.62 m 로 단조 증가하며 되잡지 못했다.
+        self.los_ki = 0.35  # 적분 이득 [1/s]
+        self.los_i_max = 2.5  # 적분항 상한 [m] (와인드업 방지)
+        self.max_crab = math.radians(60.0)  # 게걸음각 상한. asin(0.45/0.5)=64° 를 고려
+
+        # --- ④ FLS 회피 ---
         self.avoid_range = 4.0  # 이 거리 안의 반사를 장애물로 본다 [m]
         self.clear_margin = 0.9  # 선체 반폭(0.465)+여유. 각폭 팽창에 쓴다 [m]
-        self.avoid_slow = 0.30  # 회피 중 접근 속력 [m/s]
+        self.avoid_slow = 0.35  # 회피 중 접근 속력 [m/s]
+        # 조종성 확보 최소 속력(maintain way). 부족구동선은 **전진해야만 횡방향을
+        # 바꿀 수 있다.** 종방향 루프가 "멈춰"라고 하면 횡편차를 잡을 수단도 사라진다.
+        # 실측: 대기선을 0.18 m 지나치자 후진 지령이 걸렸는데, 복귀 침로(150°)에서
+        # 후진은 +x 로 밀려나는 방향이라 x 오차가 +1.4 → +14.4 m 로 발산했다.
+        self.v_min_transit = 0.30  # [m/s]
+        self.avoid_hold_s = 1.5  # 우회 방향 유지 시간 [s]
+
+        # 상태
+        self._in_final = torch.zeros(num_envs, dtype=torch.bool, device=device)
+        self._avoid_hold = z()  # 남은 유지 시간 [s]
+        self._avoid_dir = z()  # 우회 방향 부호 (-1 우현쪽 / +1 좌현쪽)
+        self._i_ct = z()  # 횡편차 적분항 [m·s]
 
     def reset_idx(self, ids: torch.Tensor):
-        for t in (self._i_dist, self._i_yaw, self._e_dist_prev, self._e_yaw_prev):
+        for t in (self._i_dist, self._i_yaw, self._e_dist_prev, self._e_yaw_prev,
+                  self._avoid_hold, self._avoid_dir, self._i_ct):
             t[ids] = 0.0
+        self._in_final[ids] = False
 
     def _avoid(
         self, fls: torch.Tensor, yaw: torch.Tensor, desired_yaw: torch.Tensor,
@@ -134,15 +204,33 @@ class DockingPID:
 
         # 목표 방위를 선체 기준으로
         goal_rel = _wrap_pi(desired_yaw - yaw).view(N, 1)
-        cost = (ang - goal_rel).abs() + 10.0 * unsafe.float()
-        best = cost.argmin(dim=1)
-        pick = torch.gather(ang.expand(N, nb), 1, best.view(N, 1)).squeeze(1)
 
         # 목표 방향 자체가 막혔을 때만 회피로 간주
-        gi = (goal_rel.clamp(-half, half) - ang).abs().argmin(dim=1)  # (N,1)-(1,nb) → (N,nb)
+        gi = (goal_rel.clamp(-half, half) - ang).abs().argmin(dim=1)
         goal_blocked = torch.gather(unsafe, 1, gi.view(N, 1)).squeeze(1)
 
-        return torch.where(goal_blocked, yaw + pick, desired_yaw), goal_blocked
+        # ④ 이력: 새로 막히면 우회 방향을 정하고 avoid_hold_s 동안 **유지**한다.
+        #   이전 구현은 매 스텝 최적 빔을 다시 골랐다. 틀면 목표 방향이 다시 열리고
+        #   곧바로 되돌아와 극한 주기에 빠진다(실측 왕복 28회, 30초 배회).
+        fresh = goal_blocked & (self._avoid_hold <= 0.0)
+        cost0 = (ang - goal_rel).abs() + 10.0 * unsafe.float()
+        side = torch.sign(
+            torch.gather(ang.expand(N, nb), 1, cost0.argmin(dim=1).view(N, 1)).squeeze(1)
+        )
+        self._avoid_dir = torch.where(fresh, torch.where(side == 0, torch.ones_like(side), side),
+                                      self._avoid_dir)
+        self._avoid_hold = torch.where(
+            goal_blocked, torch.full_like(self._avoid_hold, self.avoid_hold_s),
+            (self._avoid_hold - self.dt).clamp(min=0.0),
+        )
+        avoiding = self._avoid_hold > 0.0
+
+        # 정해진 쪽 빔만 후보로 둔다(반대쪽으로 되틀지 않게)
+        same_side = (ang * self._avoid_dir.view(N, 1)) >= -1e-6
+        cost = (ang - goal_rel).abs() + 10.0 * unsafe.float() + 10.0 * (~same_side).float()
+        pick = torch.gather(ang.expand(N, nb), 1, cost.argmin(dim=1).view(N, 1)).squeeze(1)
+
+        return torch.where(avoiding, yaw + pick, desired_yaw), avoiding
 
     def __call__(
         self,
@@ -152,17 +240,44 @@ class DockingPID:
         target: torch.Tensor,
         fls: torch.Tensor | None = None,
     ) -> torch.Tensor:
-        dx = target[:, 0] - pos_xy[:, 0]
-        dy = target[:, 1] - pos_xy[:, 1]
-        dist = torch.hypot(dx, dy)
+        b = C.BerthCfg()
+        berth_x = target[:, 0]
+        # 목표 y = WALL_Y - 0.50 - LOA/2 이므로 벽·입구를 역산한다(참값을 쓰지 않는다)
+        wall_y = target[:, 1] + 0.50 + C.LOA / 2
+        entrance_y = wall_y - b.pile_length  # 슬립 입구
+        final_yaw = target[:, 2]
 
-        # 시선각 유도: 멀면 목표 방향, 가까우면 최종 선수각으로 부드럽게 전환
-        los = torch.atan2(dy, dx)
-        blend = torch.clamp(dist / 3.0, 0.0, 1.0)
-        desired_yaw = torch.atan2(
-            blend * torch.sin(los) + (1 - blend) * torch.sin(target[:, 2]),
-            blend * torch.cos(los) + (1 - blend) * torch.cos(target[:, 2]),
-        )
+        # ── ① 중심선 경로추종 + 정렬 게이트 ──────────────────────────────
+        # 처음엔 "슬립 입구 앞 경유점 W 로 간다"로 짰는데 **지나치면 되돌아갔다.**
+        # 조준점이 뒤에 놓이니 선수가 뒤로 돌고(실측 141°→171°→-160°) 정렬 조건이
+        # 영원히 성립하지 않아 입구 앞에서 40초간 요동쳤다.
+        # → 이산 경유점 대신 **중심선 경로추종**(Fossen LOS)으로 바꾼다.
+        #   지나침이라는 개념 자체가 없어진다.
+        x_err = pos_xy[:, 0] - berth_x  # 중심선 횡편차 (우현 +)
+
+        # ③ LOS 유도: 전방주시거리 Δ 앞의 중심선 위 점을 향한다.
+        #   선수 90°+δ 는 (-sinδ, cosδ) 방향이므로 우현 이탈(x_err>0)에 δ>0 이어야 한다.
+        #   부족구동선은 횡추력이 없어 이 선수 오프셋(게걸음각)이 유일한 횡방향 수단이다.
+        # ILOS: 적분항이 정상 유속을 상쇄한다. 순수 LOS 는 유속에 정상 편차를 남긴다.
+        self._i_ct = (self._i_ct + x_err * self.dt).clamp(-self.los_i_max, self.los_i_max)
+        crab = torch.atan2(x_err + self.los_ki * self._i_ct,
+                           torch.full_like(x_err, self.los_lookahead))
+        desired_yaw = final_yaw + crab.clamp(-self.max_crab, self.max_crab)
+
+        # 정렬 게이트: 중심선과 선수가 모두 맞기 전에는 슬립에 들어가지 않는다.
+        #   부족구동선은 슬립 안에서 횡방향 수정이 불가능하므로,
+        #   비스듬히 들어가면 반드시 핑거를 스친다(이전 구현의 실측 실패 양상).
+        yaw_ok = _wrap_pi(yaw - final_yaw).abs() < self.entry_yaw_tol
+        aligned = (x_err.abs() < self.entry_x_tol) & yaw_ok
+        abort = x_err.abs() > self.entry_abort_x
+        self._in_final = (self._in_final | aligned) & (~abort)
+
+        # 조준점: 정렬 전이면 입구 앞 대기선까지만 간다(거기서 감속해 멈춰 정렬한다)
+        gate_y = entrance_y - self.entry_standoff
+        aim_y = torch.where(self._in_final, target[:, 1], torch.minimum(target[:, 1], gate_y))
+        dx = berth_x - pos_xy[:, 0]
+        dy = aim_y - pos_xy[:, 1]
+        dist = torch.hypot(dx, dy)
 
         avoiding = torch.zeros_like(dist, dtype=torch.bool)
         if fls is not None:
@@ -170,16 +285,38 @@ class DockingPID:
 
         e_yaw = _wrap_pi(desired_yaw - yaw)
 
-        # 전진 루프 — **부호 있는 종방향 오차**를 쓴다.
-        #   초기 구현은 v_ref = clamp(dist*0.5, 0, v_max) 였다. 거리는 부호가 없으므로
-        #   목표를 지나쳐도 계속 전진을 명령했고, 배가 벽을 뚫고 나간 뒤 제자리에서
-        #   회전했다(오프라인 궤적 시험에서 확인: t=20s 거리 0.26 m → t=28s y=10.57).
-        #   선체 전방축에 오차를 투영해 부호를 살리면 지나쳤을 때 후진이 나온다.
-        along = dx * torch.cos(yaw) + dy * torch.sin(yaw)
+        # ── ② 제동거리 기반 감속 ──────────────────────────────────────────
+        # **부호 있는 잔여거리**를 쓴다. 거리는 부호가 없으므로 목표를 지나쳐도
+        # 계속 전진을 명령했고, 배가 벽을 뚫고 나간 뒤 제자리에서 회전했다.
+        #
+        # ★ 투영 축은 **경로(중심선) 방향**이다. 선수 방향이 아니다.
+        #   선수축에 투영했더니 게걸음각이 커질 때 잔여거리가 0 으로 붕괴했다.
+        #   실측: 대기선까지 1.36 m 남았는데 선수 134°, 목표 방위 224° 라
+        #   along = 0.681 - 0.676 = +0.005 → 제어기가 "다 왔다"로 판단해 감속을 멈췄고,
+        #   그대로 대기선을 0.94 m 지나쳐 선수 꼭짓점이 핑거 모서리를 스쳤다.
+        #   유속과 싸우느라 게걸음각이 클수록 이 붕괴가 심해진다.
+        along = dx * torch.cos(final_yaw) + dy * torch.sin(final_yaw)
+
+        # v_ref = sqrt(2·a·along) — 남은 거리에서 정지할 수 있는 최대 속력.
+        # 이전 구현은 v_ref = along×0.6 (상한 0.6) 이라 종방향 1 m 안에 들어와야
+        # 감속이 시작됐고, 그 전에 핑거에 부딪혔다(실측 2.46 m 지점, 0.51 m/s 순항 중).
+        v_brake = torch.sqrt(2.0 * self.brake_accel * along.clamp(min=0.0))
         v_max = torch.where(avoiding, torch.full_like(along, self.avoid_slow),
                             torch.full_like(along, self.approach_speed))
-        v_ref = torch.clamp(along * 0.6, -0.30, 1.0) .minimum(v_max)
-        e_dist = v_ref - nu[:, 0]
+        v_ref = torch.where(along >= 0.0, torch.minimum(v_brake, v_max),
+                            (along * 0.6).clamp(min=-0.30))
+
+        # ★ 속도 오차도 **같은 축**에서 재야 한다.
+        #   잔여거리만 경로축으로 바꾸고 속도는 선체 전진속도 nu[0] 를 그대로 썼더니
+        #   게걸음 중 두 양이 다른 물리량이 되어 루프가 어긋났다(최종거리 16 m, 벽 충돌).
+        #   경로 진행속도 = 속도벡터를 경로 방향에 투영한 값.
+        psi_t = _wrap_pi(yaw - final_yaw)  # 경로 대비 선수 오차
+        v_path = nu[:, 0] * torch.cos(psi_t) - nu[:, 1] * torch.sin(psi_t)
+        # 정렬 전에는 속력을 0 으로 떨어뜨리지 않는다(위 v_min_transit 주석 참조).
+        # 최종 진입 단계에서만 제동 프로파일이 0 까지 지배한다.
+        v_ref = torch.where(self._in_final, v_ref,
+                            torch.maximum(v_ref, torch.full_like(v_ref, self.v_min_transit)))
+        e_dist = v_ref - v_path
 
         self._i_dist = (self._i_dist + e_dist * self.dt).clamp(-2.0, 2.0)
         self._i_yaw = (self._i_yaw + e_yaw * self.dt).clamp(-1.0, 1.0)
