@@ -100,6 +100,10 @@ SCENES = [
     dict(berth_x=0.0, cur=0.00, d0=9.0, bear=-10.0, yaw_err=+15.0, gear=[]),
     dict(berth_x=0.0, cur=+0.10, d0=9.0, bear=-10.0, yaw_err=+15.0, gear=[]),
     dict(berth_x=0.0, cur=+0.20, d0=9.0, bear=-10.0, yaw_err=+15.0, gear=[]),
+    # 11~13: 경계를 촘촘히 (0.05 / 0.15 / 0.18). 0.18 은 설계 장면 6 과 같은 유속.
+    dict(berth_x=0.0, cur=+0.05, d0=9.0, bear=-10.0, yaw_err=+15.0, gear=[]),
+    dict(berth_x=0.0, cur=+0.15, d0=9.0, bear=-10.0, yaw_err=+15.0, gear=[]),
+    dict(berth_x=0.0, cur=+0.18, d0=9.0, bear=-10.0, yaw_err=+15.0, gear=[]),
 ]
 
 

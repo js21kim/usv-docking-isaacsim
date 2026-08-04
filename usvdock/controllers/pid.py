@@ -109,7 +109,14 @@ class DockingPID:
         # --- ② 제동 프로파일 ---
         # 목표 허용오차(종방향 0.35 m, 속력 0.20 m/s)를 만족하려면
         # along=0.2 m 에서 v≈0.2 여야 한다 → a = v²/(2·along) ≈ 0.10
-        self.brake_accel = 0.12  # [m/s²]
+        # 슬립 안에서 제동한다. 입구~목표가 1.4 m 이므로 0.6 m/s 에서 멈추려면
+        #   a > v²/(2·1.4) = 0.13 이 필요하고, 여유를 두어 0.30 으로 잡는다.
+        #   추력 여유는 충분하다(70 N / 약 36 kg ≈ 1.9 m/s²).
+        # ★ 입구 앞에서 미리 감속하면 안 된다. 느릴수록 게걸음각이 커지고
+        #   (δ=asin(V/u)) 유효 선폭이 넓어져 슬립을 통과할 수 없다.
+        #   실측: 0.276 m/s 진입 → δ=40.7° → 유효폭 1.488 m, 현당 여유 0.056 m.
+        #   0.60 m/s 진입이면 δ=17.5°, 유효폭 1.247 m, 여유 0.176 m 로 통과 가능하다.
+        self.brake_accel = 0.30  # [m/s²]
 
         # --- ③ 횡편차 루프 ---
         # ILOS(적분 시선각): 정상 유속을 적분항으로 상쇄한다.
@@ -267,8 +274,17 @@ class DockingPID:
         # 정렬 게이트: 중심선과 선수가 모두 맞기 전에는 슬립에 들어가지 않는다.
         #   부족구동선은 슬립 안에서 횡방향 수정이 불가능하므로,
         #   비스듬히 들어가면 반드시 핑거를 스친다(이전 구현의 실측 실패 양상).
-        yaw_ok = _wrap_pi(yaw - final_yaw).abs() < self.entry_yaw_tol
-        aligned = (x_err.abs() < self.entry_x_tol) & yaw_ok
+        # ★ 정렬은 **선수각이 아니라 침로(course over ground)** 로 본다.
+        #   유속이 있으면 배는 반드시 게걸음을 한다 — 최대 속력에서도 17.5°(유속 0.18).
+        #   선수각으로 20° 이내를 요구하면 이 조건이 **원리적으로 성립하지 않아**
+        #   영원히 대기선에 묶이고, 그 사이 유속에 밀려 핑거에 닿는다(실측 4건).
+        #   게걸음을 하더라도 침로가 슬립축과 맞으면 그것이 올바른 정렬이다.
+        vx = nu[:, 0] * torch.cos(yaw) - nu[:, 1] * torch.sin(yaw)
+        vy = nu[:, 0] * torch.sin(yaw) + nu[:, 1] * torch.cos(yaw)
+        moving = torch.hypot(vx, vy) > 0.05
+        course = torch.atan2(vy, vx)
+        course_ok = moving & (_wrap_pi(course - final_yaw).abs() < self.entry_yaw_tol)
+        aligned = (x_err.abs() < self.entry_x_tol) & course_ok
         abort = x_err.abs() > self.entry_abort_x
         self._in_final = (self._in_final | aligned) & (~abort)
 
