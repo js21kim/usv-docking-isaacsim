@@ -9,8 +9,16 @@ results/
 usvdock/assets/blueboat/
 
 # 그림·영상 — 대표 몇 장만 docs/ 에 둔다
-figures/
+# 그림·영상은 원칙적으로 제외한다(재생성 가능하고 용량이 크다).
+# 다만 **4컷 비교 영상은 MP4 로 올린다** — 결과물 자체이고 발표에 그대로 쓴다.
+#   GIF 는 17.7 MB, 같은 내용의 MP4 는 1.5 MB (약 1/12). GIF 는 계속 제외한다.
+#   ※ "figures/" 로 디렉터리 자체를 제외하면 git 이 그 안으로 들어가지 않아
+#      하위 예외(!)가 전혀 먹지 않는다. **내용물**을 제외해야 한다.
+figures/*
 !figures/.gitkeep
+!figures/*/
+figures/*/*
+!figures/*/*.mp4
 
 # 파이썬
 __pycache__/
