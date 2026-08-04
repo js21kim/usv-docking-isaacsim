@@ -322,7 +322,9 @@ def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("npz", nargs="+")
     ap.add_argument("--titles", nargs="*", default=None)
-    ap.add_argument("--out", default=f"{ROOT}/figures/learning_progress.mp4")
+    # 기본 출력은 figures/latest — make_figures.py 가 갱신하는 심볼릭 링크를 따라간다.
+    # 시나리오가 바뀔 때마다 폴더를 새로 만들고 링크만 옮기면 이전 결과가 보존된다.
+    ap.add_argument("--out", default=f"{ROOT}/figures/latest/learning_progress.gif")
     ap.add_argument("--fps", type=int, default=25)
     ap.add_argument("--stride", type=int, default=2, help="프레임 솎기(속도)")
     a = ap.parse_args()

@@ -81,6 +81,22 @@ class DockingEnv(DirectRLEnv):
         self._outcome_code = torch.zeros(N, dtype=torch.long, device=dev)
 
         self._env_steps = 0  # 유속 커리큘럼 진행도
+        self._sensor_cache = None  # 스텝당 센서 캐시
+        self._sensor_key = -1
+        # ── 버스 추정 유지 (최소 기억) ────────────────────────────────────
+        # 단일 프레임 검출만 쓰면 **종단에서 눈이 감긴다**: 배가 버스 옆으로 붙으면
+        # 가까운 핑거가 먼 핑거를 가려 한쪽만 보이고, "핑거 쌍" 조건이 깨진다.
+        # 실측: 벽까지 2 m 안쪽에서 횡오프셋 1 m 만 있어도 검출 실패.
+        # 실제로 정책이 목표 1.9 m 앞에서 검출을 잃고 40초를 배회했다(검출률 23.4%).
+        #
+        # → 마지막 유효 추정을 **자기 운동으로 추측항법**하며 유지하고,
+        #   경과 시간을 정책에 함께 준다. 실무에서 표준적인 처리이며,
+        #   필요한 자기 운동 정보는 IMU/DVL 로 실제 관측 가능한 양이다.
+        #   (전역 지도나 SLAM 이 아니다 — 대상 하나의 상대 위치를 끌고 갈 뿐이다)
+        self._berth_rel = torch.zeros(N, 2, device=dev)  # 세계축 정렬, 선체 중심
+        self._berth_age = torch.full((N,), 1e3, device=dev)  # 마지막 검출 후 경과 [s]
+        self._berth_key = -1  # 스텝당 1회만 갱신 (센서 캐시와 같은 방식)
+        self._last_dxy = torch.zeros(N, 2, device=dev)  # 직전 스텝 세계 변위
         self._resample_scene(torch.arange(N, device=dev))
 
     # ------------------------------------------------------------------ scene
@@ -159,8 +175,11 @@ class DockingEnv(DirectRLEnv):
         c, s = torch.cos(self._eta[:, 2]), torch.sin(self._eta[:, 2])
         vx = self._nu[:, 0] * c - self._nu[:, 1] * s
         vy = self._nu[:, 0] * s + self._nu[:, 1] * c
-        self._eta[:, 0] += self.step_dt * vx
-        self._eta[:, 1] += self.step_dt * vy
+        dx_w = self.step_dt * vx
+        dy_w = self.step_dt * vy
+        self._last_dxy = torch.stack([dx_w, dy_w], dim=-1)  # 추측항법용 세계 변위
+        self._eta[:, 0] += dx_w
+        self._eta[:, 1] += dy_w
         self._eta[:, 2] = _wrap_pi(self._eta[:, 2] + self.step_dt * self._nu[:, 2])
 
         self._write_pose()
@@ -195,13 +214,37 @@ class DockingEnv(DirectRLEnv):
         # 우리가 적분한 자세와 어긋난다. 운동은 전적으로 Fossen 모델이 결정한다.
         self._boat.write_root_velocity_to_sim(torch.zeros(N, 6, device=self.device))
 
+    # ------------------------------------------------------------------ 센서
+    def sensors(self) -> tuple[torch.Tensor, torch.Tensor]:
+        """스텝당 한 번만 스캔하고 캐시한다. (고해상도 LiDAR, FLS)
+
+        같은 스텝에서 관측·버스검출·PID 회피가 각자 스캔을 다시 뜨면 낭비가 크다.
+        평가에서 스텝당 LiDAR 스캔이 3회, FLS 가 2회 돌고 있었다.
+
+        72빈 정책 입력은 360빈에서 5칸씩 뽑으면 **정확히 같은 값**이다:
+            72빈[i] 의 방위 = i·2π/72 = (5i)·2π/360 = 360빈[5i] 의 방위
+        """
+        key = int(self.common_step_counter)
+        if self._sensor_key == key and self._sensor_cache is not None:
+            return self._sensor_cache
+        s = BB.SensorMountCfg()
+        pos, yaw = self._eta[:, :2], self._eta[:, 2]
+        lid = G.lidar_scan(pos, yaw, self._scene_p, n_bins=s.lidar_det_h_bins, mount=s)
+        fls = G.fls_scan(pos, yaw, self._scene_p)
+        self._sensor_cache = (lid, fls)
+        self._sensor_key = key
+        return self._sensor_cache
+
     # ------------------------------------------------------------------ obs
     def _get_observations(self) -> dict:
         p = self._scene_p
         pos = self._eta[:, :2]
         yaw = self._eta[:, 2]
 
-        lidar = G.lidar_scan(pos, yaw, p)
+        s_cfg = BB.SensorMountCfg()
+        lid360, fls_full = self.sensors()
+        step = s_cfg.lidar_det_h_bins // s_cfg.lidar_obs_h_bins  # 360//72 = 5
+        lidar = lid360[:, ::step]
         ego = torch.stack(
             [
                 self._nu[:, 0] / BB.MAX_SPEED,
@@ -215,14 +258,13 @@ class DockingEnv(DirectRLEnv):
             ],
             dim=-1,
         )
-        # 세 Arm 이 공유하는 인지 프론트엔드. Arm A(PID)도 같은 검출기를 쓴다.
+        # 세 방식이 공유하는 인지 프론트엔드. PID 도 같은 검출기를 쓴다.
         # 정답 좌표가 아니라 LiDAR 스캔에서 추정한 값이므로 공정성이 유지된다.
-        berth = PC.berth_features(pos, yaw, p)
+        berth = self._berth_features()
         parts = [ego, self._prev_action, berth, lidar]
 
         if self.cfg.use_fls:
-            fls = G.fls_scan(pos, yaw, p)  # (N,128)
-            fls = fls.view(self.num_envs, _FLS_BINS, -1).min(dim=-1).values  # 다운샘플(최근접 보존)
+            fls = fls_full.view(self.num_envs, _FLS_BINS, -1).min(dim=-1).values  # 최근접 보존
         else:
             # Arm B: FLS 없음. 정책 입력 크기를 맞추기 위해 상수 1.0(무반사)로 채운다.
             # 값이 항상 같으므로 정보가 되지 않는다.
@@ -230,6 +272,58 @@ class DockingEnv(DirectRLEnv):
         parts.append(fls)
 
         return {"policy": torch.cat(parts, dim=-1)}
+
+    def update_berth_estimate(self) -> tuple[torch.Tensor, torch.Tensor]:
+        """버스 추정을 갱신한다. 검출되면 새 값, 아니면 추측항법으로 끌고 간다.
+
+        ★ **스텝당 한 번만** 갱신한다. PID 경로에서는 정책이 한 번, 환경의
+          _get_observations 가 또 한 번 불러 추측항법이 **이중 적용**된다.
+          (RL 경로는 관측에서만 불려 1회 — 두 방식이 서로 다른 추정을 받게 된다)
+          센서 캐시와 같은 방식으로 스텝 카운터에 걸어 멱등하게 만든다.
+
+        Returns: (추정 (N,2) [상대x, 벽거리], 경과시간 (N,))
+        """
+        key = int(self.common_step_counter)
+        if self._berth_key == key:
+            return self._berth_rel, self._berth_age
+        self._berth_key = key
+
+        lid360, _ = self.sensors()
+        pos, yaw = self._eta[:, :2], self._eta[:, 2]
+        rel_x, wall_d, ok = PC.detect_berth(pos, yaw, self._scene_p, scan=lid360)
+
+        # 배가 움직인 만큼 상대 위치를 당긴다(세계축 정렬 좌표이므로 단순 뺄셈).
+        #
+        # ★ 시뮬레이터의 정확한 변위를 그대로 쓰면 **공짜 점심**이다. 수면을 LiDAR
+        #   대상에서 뺀 것과 같은 이유로, 실기 DVL/IMU 수준의 오차를 섞는다.
+        #   DVL 속도 오차는 보통 측정치의 1~2 % → 변위에 비례 잡음으로 준다.
+        #   이 잡음이 누적되므로 오래 끌수록 추정이 실제로 나빠지고,
+        #   정책은 "가끔은 다시 봐야 한다"를 배울 수밖에 없다.
+        noisy = self._last_dxy * (
+            1.0 + self.cfg.odom_noise_frac * torch.randn_like(self._last_dxy)
+        )
+        self._berth_rel = self._berth_rel - noisy
+        fresh = torch.stack([rel_x, wall_d], dim=-1)
+        self._berth_rel = torch.where(ok.unsqueeze(-1), fresh, self._berth_rel)
+        self._berth_age = torch.where(ok, torch.zeros_like(self._berth_age),
+                                      self._berth_age + self.step_dt)
+        return self._berth_rel, self._berth_age
+
+    def _berth_features(self) -> torch.Tensor:
+        """정책 입력 (N,5): 선체좌표 상대위치 2 + 선수각오차 2 + 추정 신선도 1."""
+        rel, age = self.update_berth_estimate()
+        yaw = self._eta[:, 2]
+        ty_off = 0.50 + BB.LOA / 2
+        dx, dy = rel[:, 0], rel[:, 1] - ty_off
+        c, s = torch.cos(yaw), torch.sin(yaw)
+        bx = dx * c + dy * s
+        by = -dx * s + dy * c
+        yaw_err = _wrap_pi(math.pi / 2 - yaw)
+        # 신선도: 방금 검출 1.0 → 오래될수록 0. 정책이 추정을 얼마나 믿을지 판단한다.
+        fresh = torch.exp(-age / 2.0)
+        return torch.stack(
+            [bx / 20.0, by / 20.0, torch.cos(yaw_err), torch.sin(yaw_err), fresh], dim=-1
+        )
 
     # ------------------------------------------------------------------ reward
     def _get_rewards(self) -> torch.Tensor:
@@ -341,8 +435,16 @@ class DockingEnv(DirectRLEnv):
 
     # ------------------------------------------------------------------ reset
     def _current_scale(self) -> float:
-        """유속 커리큘럼: 누적 스텝에 따라 0 → 1 로 선형 증가."""
-        w = max(1, self.cfg.current_warmup_steps)
+        """유속 커리큘럼: 누적 스텝에 따라 0 → 1 로 선형 증가.
+
+        ★ warmup <= 0 이면 커리큘럼을 끄고 항상 1.0 을 쓴다(평가용).
+          평가에서 환경을 새로 만들면 _env_steps=0 이라 유속이 0 으로 강제된다.
+          그러면 학습보다 훨씬 쉬운 조건에서 재게 되어 성능이 과대평가된다.
+          (실제로 이 버그로 롤아웃 유속이 전부 0.00 으로 나왔다)
+        """
+        w = self.cfg.current_warmup_steps
+        if w <= 0:
+            return 1.0
         return min(1.0, self._env_steps / w)
 
     def _resample_scene(self, ids: torch.Tensor):
@@ -383,6 +485,10 @@ class DockingEnv(DirectRLEnv):
         self._nu[env_ids] = 0.0
         self._thrust[env_ids] = 0.0
         self._prev_action[env_ids] = 0.0
+        self._berth_rel[env_ids] = 0.0
+        self._berth_age[env_ids] = 1e3
+        self._last_dxy[env_ids] = 0.0
+        self._berth_key = -1
         self._hold[env_ids] = 0
         self._docked[env_ids] = False
         self._collided[env_ids] = False

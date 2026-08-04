@@ -27,7 +27,7 @@ from isaaclab.utils import configclass
 
 from .. import blueboat_cfg as BB
 
-# LiDAR 72 bin + 자기상태 8 + 직전행동 2 + 버스검출 특징 5
+# LiDAR 72 bin + 자기상태 8 + 직전행동 2 + 버스추정 특징 5(추측항법 유지)
 _OBS_LIDAR = 72 + 8 + 2 + 5
 # FLS 는 128 빔을 32 로 다운샘플 (정책 입력을 과하게 키우지 않는다)
 _FLS_BINS = 32
@@ -185,4 +185,8 @@ class DockingEnvCfg(DirectRLEnvCfg):
     # 외부 훅 없이 환경이 누적 스텝으로 자체 진행한다(rsl-rl 에 콜백을 넣지 않아도 된다).
     # 2048 env × 64 step/iter = 131,072 step/iter 이므로 300만 스텝은 23 iter 만에
     # 끝나 커리큘럼 구실을 못 했다(current_scale 이 즉시 1.0). 약 150 iter 로 늘린다.
+    # 추측항법 주행거리계 잡음 (변위 대비 비율). DVL 속도 오차 1~2 % 수준.
+    # 0 으로 두면 시뮬레이터의 정확한 변위를 쓰게 되어 실기에서 무너진다.
+    odom_noise_frac: float = 0.02
+
     current_warmup_steps: int = 20_000_000

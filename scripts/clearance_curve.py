@@ -60,7 +60,7 @@ def measure(env, policy, n_steps: int) -> dict:
     path = torch.zeros(N, device=dev)
 
     for _ in range(n_steps):
-        with torch.inference_mode():
+        with torch.no_grad():
             act = policy(obs)
             # 이격거리와 경로는 step() **전에** 누적한다(자동 리셋이 상태를 바꾼다)
             col = G.check_collision(env._eta[:, :2], env._eta[:, 2], env._scene_p)
@@ -108,6 +108,9 @@ def main():
     cfg.scene.num_envs = args_cli.episodes
     cfg.current_range = (lo, hi)
     cfg.seed = args_cli.seed
+    # 유속 커리큘럼을 끈다. 새 환경은 _env_steps=0 이라 유속이 0 으로 강제되어
+    # 학습보다 쉬운 조건에서 재게 된다.
+    cfg.current_warmup_steps = 0
     env = gym.make(args_cli.task, cfg=cfg, render_mode=None).unwrapped
 
     from isaaclab_rl.rsl_rl import RslRlVecEnvWrapper

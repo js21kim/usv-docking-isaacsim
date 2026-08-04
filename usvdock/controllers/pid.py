@@ -75,9 +75,32 @@ class DockingPID:
             t[ids] = 0.0
 
     def _avoid(
-        self, fls: torch.Tensor, yaw: torch.Tensor, desired_yaw: torch.Tensor
+        self, fls: torch.Tensor, yaw: torch.Tensor, desired_yaw: torch.Tensor,
+        pos_xy: torch.Tensor, target: torch.Tensor,
     ) -> tuple[torch.Tensor, torch.Tensor]:
         """FLS 스캔에서 통과 가능한 최적 방향을 고른다.
+
+        ★ **알려진 접안 구조물은 회피 대상에서 뺀다.**
+
+          초기 구현은 FLS 반사를 전부 장애물로 봤다. 그런데 FLS 는 폐어구뿐 아니라
+          핑거와 벽도 돌려준다. 목표는 슬립 **안쪽**(y=8.9)이고 구조물은 y=7.5~10.0 이므로,
+          배가 부두 4 m 안으로 들어오면 목표 방위가 **항상** goal_blocked 이 되고
+          회피가 부두 반대편 빈 물로 조타했다. 거기에 surge *= cos(e_yaw) 가 겹쳐
+          선수오차 90°에서 전진 추력이 0 이 되어 완전히 멈췄다.
+
+          실측(폐어구가 **하나도 없는** 장면): 횡오차 0.02 m 로 정렬해 놓고
+          접근축 2.31 m 를 남긴 채 선수 180°, 속력 0.000 으로 교착. 유속·장애물과
+          무관한 결정론적 실패였다 — 즉 **목적지를 장애물로 인식하고 도망친 것**이다.
+
+          이 상태의 PID 를 대조군으로 쓰면 "RL 이 이겼다"가 아니라
+          "고장 난 베이스라인을 이겼다"가 된다.
+
+          → 검출된 선석 기하로 **알려진 구조물에 해당하는 빔을 가려내고**,
+            나머지(지도에 없는 반사)만 위험으로 본다. 실제 엔지니어가 만들 파이프라인이고,
+            RL 에 없는 정보를 주는 것도 아니다(선석 위치는 LiDAR 검출로 이미 갖고 있다).
+
+          한계: 슬립 **안쪽**에 폐어구가 떠 있으면 가려져 못 본다. 본 연구의 장면
+          분포에서는 폐어구가 y∈[3.0, 6.5], 구조물이 y≥7.5 로 겹치지 않는다.
 
         Returns:
             새 목표 선수각, 회피 작동 여부(bool)
@@ -88,7 +111,20 @@ class DockingPID:
         half = math.radians(s.fls_h_fov_deg / 2)
         ang = torch.linspace(-half, half, nb, device=fls.device).view(1, nb)
 
-        blocked = (fls < 0.999) & (rng < self.avoid_range)  # (N,nb)
+        # --- 알려진 구조물 빔 가려내기 ---
+        # 빔 끝점을 세계좌표로 옮긴 뒤, 검출된 선석의 footprint 안이면 구조물로 본다.
+        b = C.BerthCfg()
+        berth_x = target[:, 0].view(-1, 1)
+        # 목표 y = WALL_Y - 0.50 - LOA/2 이므로 역산한다(참값을 쓰지 않는다)
+        wall_y = (target[:, 1] + 0.50 + C.LOA / 2).view(-1, 1)
+        th = (yaw.view(-1, 1) + ang)  # 세계 기준 빔 방위
+        ex = pos_xy[:, 0].view(-1, 1) + rng * torch.cos(th)
+        ey = pos_xy[:, 1].view(-1, 1) + rng * torch.sin(th)
+        half_span = b.pile_gap / 2 + b.pile_diameter + 0.60  # 핑거 바깥까지 + 여유
+        known = (
+            (ey > wall_y - b.pile_length - 0.40) & ((ex - berth_x).abs() < half_span)
+        ) | (ey > wall_y - 0.40)  # 벽면은 x 무관
+        blocked = (fls < 0.999) & (rng < self.avoid_range) & (~known)  # (N,nb)
 
         # 각폭 팽창: 거리 r 의 장애물은 asin(여유/r) 만큼 좌우로 넓혀 봐야 한다.
         # (배가 점이 아니라 폭을 갖기 때문. 안 하면 장애물 가장자리를 스치며 지나간다)
@@ -130,7 +166,7 @@ class DockingPID:
 
         avoiding = torch.zeros_like(dist, dtype=torch.bool)
         if fls is not None:
-            desired_yaw, avoiding = self._avoid(fls, yaw, desired_yaw)
+            desired_yaw, avoiding = self._avoid(fls, yaw, desired_yaw, pos_xy, target)
 
         e_yaw = _wrap_pi(desired_yaw - yaw)
 

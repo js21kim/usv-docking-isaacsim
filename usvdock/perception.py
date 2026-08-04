@@ -57,6 +57,7 @@ def detect_berth(
     yaw: torch.Tensor,
     scene: "G.SceneParams",
     mount: C.SensorMountCfg | None = None,
+    scan: torch.Tensor | None = None,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     """스캔에서 버스를 검출한다. **참 위치를 쓰지 않는다.**
 
@@ -69,8 +70,11 @@ def detect_berth(
         ok:    (N,) 검출 성공 여부
     """
     s = mount if mount is not None else C.SensorMountCfg()
+    # scan 을 받으면 재계산하지 않는다. 한 스텝에서 관측·검출·PID 가 같은 스캔을
+    # 각자 다시 뜨면 낭비가 크다(평가에서 스텝당 LiDAR 스캔이 3회 돌고 있었다).
     R = s.lidar_det_h_bins
-    scan = G.lidar_scan(pos_xy, yaw, scene, n_bins=R, mount=s)
+    if scan is None:
+        scan = G.lidar_scan(pos_xy, yaw, scene, n_bins=R, mount=s)
     N = pos_xy.shape[0]
     rng = scan * s.lidar_obs_max_range
 
@@ -91,9 +95,22 @@ def detect_berth(
     #   → **광선 방향**으로 제한한다. 세계 +y(벽 법선) 기준 ±45° 부채꼴만 본다.
     #     이 방향의 광선은 버스 벽 아니면 핑거에 맞는다. 위치가 아니라 방향으로
     #     자르는 것이 이 문제의 올바른 형태다("벽 쪽을 본다").
-    #   부채꼴 폭은 실측으로 정했다(검출률): ±30° 91.9%, **±40° 97.4%**, ±45° 95.0%.
+    #   부채꼴 폭은 원거리 실측으로 정했다: ±30° 91.9%, **±40° 97.4%**, ±45° 95.0%.
+    #
+    # ★ 근거리 예외 — 고정 부채꼴만 쓰면 **종단에서 검출이 끊긴다.**
+    #   배가 벽 가까이(y=8.5) 옆으로(x=1.85) 붙으면 핑거가 세계 +y 기준
+    #   atan2(-0.875, 1.0) = -41° 로 ±40° 밖으로 나간다.
+    #   실측 검출 지도(벽까지 거리 × 횡오프셋):
+    #       벽 8.0 m: 전부 검출        벽 3.0 m: x=1 부터 실패
+    #       벽 1.5 m: x=1 부터 실패    벽 1.0 m: **정중앙에서도 실패**
+    #   정밀도가 가장 필요한 구간이 통째로 사각이었다. 실제로 정책이 목표 1.9 m 앞에서
+    #   검출을 잃고 40초를 배회했다(검출 성공률 23.4%).
+    #
+    #   → 가까운 반사(5 m 이내)는 부채꼴과 무관하게 받는다. 근거리에서 잡히는 것은
+    #     측벽이 아니라 버스 구조물이므로 오염 위험이 없다.
     sector = (torch.remainder(ang - math.pi / 2 + math.pi, 2 * math.pi) - math.pi).abs()
-    fwd = hit & (ry > 0.5) & (sector < math.radians(40.0))
+    near = rng < 5.0
+    fwd = hit & (ry > 0.3) & ((sector < math.radians(40.0)) | near)
 
     NEG = torch.full_like(ry, -1e9)
     # 버스 벽 = 전방에서 가장 먼 반사면 (그 뒤에는 아무것도 없다)
@@ -128,7 +145,8 @@ def detect_berth(
 
 
 def berth_features(
-    pos_xy: torch.Tensor, yaw: torch.Tensor, scene: "G.SceneParams"
+    pos_xy: torch.Tensor, yaw: torch.Tensor, scene: "G.SceneParams",
+    scan: torch.Tensor | None = None,
 ) -> torch.Tensor:
     """정책 입력용 압축 특징 (N,5).
 
@@ -136,7 +154,7 @@ def berth_features(
     모두 스캔에서 나온 값이다. 검출 실패 시 0 을 넣고 플래그로 알린다 —
     정책이 "지금 안 보인다"를 구분할 수 있어야 한다.
     """
-    rel_x, wall_d, ok = detect_berth(pos_xy, yaw, scene)
+    rel_x, wall_d, ok = detect_berth(pos_xy, yaw, scene, scan=scan)
     N = pos_xy.shape[0]
 
     # 명목 정박점: 벽에서 0.5 m + 선체 반길이 앞.
